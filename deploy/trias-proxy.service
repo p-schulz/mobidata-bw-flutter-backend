@@ -1,0 +1,28 @@
+# systemd unit template for the TRIAS proxy (FastAPI/Uvicorn).
+# Filled in and installed by ../setup.sh — placeholders (__APP_DIR__, __APP_USER__,
+# __PORT__) are substituted there. Do not edit the placeholders out of this file;
+# edit the generated copy in /etc/systemd/system/ instead if you need a one-off change.
+
+[Unit]
+Description=MobiData BW TRIAS Proxy (FastAPI/Uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=__APP_USER__
+Group=__APP_USER__
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/.env
+ExecStart=__APP_DIR__/venv/bin/uvicorn main:app --host 0.0.0.0 --port __PORT__ --workers 1
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=__APP_DIR__
+
+[Install]
+WantedBy=multi-user.target
