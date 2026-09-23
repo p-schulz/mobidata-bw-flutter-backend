@@ -20,7 +20,7 @@ import pandas as pd
 # CONFIG – adjust paths and field names as needed
 # --------------------------------------------------
 
-SHP_PATH = "/home/trias/Verwaltungsgrenzen/v_al_gemeinde.shp"
+SHP_PATH = os.getenv("LGL_SHP_PATH", "/home/trias/Verwaltungsgrenzen/v_al_gemeinde.shp")
 
 # field name mappings in the shapefile
 #   gemeinde_i: Integer64 -> key/id
