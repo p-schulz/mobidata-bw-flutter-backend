@@ -16,25 +16,65 @@ from datetime import datetime, timedelta
 from urllib.request import urlopen
 
 GTFS_ZIP_URL = (
-    "https://mobidata-bw.de/gtfs-historisierung/mit_linienverlauf/2025/"
-    "20251008/bwgesamt.zip"
+    "https://mobidata-bw.de/gtfs-historisierung/mit_linienverlauf/2026/"
+    "20260601/bwgesamt.zip"
 )
 OUTPUT_PATH = os.path.join("assets", "gtfs", "gtfs_seed.sqlite")
+ZIP_CACHE_PATH = os.path.join("assets", "gtfs", os.path.basename(GTFS_ZIP_URL))
+MIN_ZIP_SIZE_BYTES = 500 * 1024 * 1024  # below this, treat a cached ZIP as incomplete/stale
 
 
 def ensure_output_dir():
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
 
 
-def download_zip() -> bytes:
+def _print_progress(downloaded: int, total: int) -> None:
+    mib = downloaded / (1024 * 1024)
+    if total:
+        pct = downloaded / total * 100
+        bar_width = 30
+        filled = int(bar_width * downloaded / total)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        total_mib = total / (1024 * 1024)
+        print(f"\r[{bar}] {pct:5.1f}%  {mib:7.1f}/{total_mib:.1f} MiB", end="", flush=True)
+    else:
+        print(f"\rDownloaded {mib:7.1f} MiB", end="", flush=True)
+
+
+def ensure_zip_downloaded(path: str) -> str:
+    """Downloads the GTFS ZIP to `path`, unless an adequately sized copy is already there."""
+    if os.path.exists(path) and os.path.getsize(path) >= MIN_ZIP_SIZE_BYTES:
+        size_mib = os.path.getsize(path) / (1024 * 1024)
+        print(f"Using cached GTFS ZIP at {path} ({size_mib:.1f} MiB), skipping download.")
+        return path
+
     print(f"Downloading GTFS ZIP from {GTFS_ZIP_URL} …")
-    with urlopen(GTFS_ZIP_URL) as resp:
-        return resp.read()
+    tmp_path = path + ".part"
+    with urlopen(GTFS_ZIP_URL) as resp, open(tmp_path, "wb") as f:
+        total = int(resp.headers.get("Content-Length") or 0)
+        downloaded = 0
+        chunk_size = 1024 * 1024  # 1 MiB
+        while True:
+            chunk = resp.read(chunk_size)
+            if not chunk:
+                break
+            f.write(chunk)
+            downloaded += len(chunk)
+            _print_progress(downloaded, total)
+        print()
+    os.replace(tmp_path, path)
+    return path
 
 
 def open_db(path: str) -> sqlite3.Connection:
     need_init = not os.path.exists(path)
     conn = sqlite3.connect(path)
+    # This is a scratch DB rebuilt from zero on every run (see main()); trading
+    # durability for I/O keeps the many periodic commits below from turning
+    # into a disk-I/O storm on constrained/slow-disk hosts. Worst case on a
+    # crash is just rerunning the script.
+    conn.execute("PRAGMA synchronous = OFF")
+    conn.execute("PRAGMA journal_mode = MEMORY")
     if need_init:
         create_schema(conn)
     return conn
@@ -147,114 +187,109 @@ def clear_tables(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def read_csv_from_zip(zf: zipfile.ZipFile, name: str):
+def iter_csv_from_zip(zf: zipfile.ZipFile, name: str):
+    """Streams rows of `name` out of the ZIP without ever holding the whole
+    (decompressed) file or its parsed rows in memory at once — GTFS files
+    like stop_times.txt can be millions of rows."""
     try:
-        data = zf.read(name)
+        raw = zf.open(name)
     except KeyError:
-        return []
-    text = io.StringIO(data.decode("utf-8"))
-    reader = csv.DictReader(text)
-    return list(reader)
+        return
+    with raw:
+        text = io.TextIOWrapper(raw, encoding="utf-8", newline="")
+        yield from csv.DictReader(text)
+
+
+BATCH_SIZE = 2000
+
+
+def _batched(rows, batch_size=BATCH_SIZE):
+    batch = []
+    for row in rows:
+        batch.append(row)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def import_stops(conn, rows):
     cur = conn.cursor()
-    cur.executemany(
-        """
-        INSERT OR REPLACE INTO stops(
-          stop_id, stop_name, stop_desc, stop_lat, stop_lon,
-          location_type, parent_station, wheelchair_boarding
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            (
-                row["stop_id"],
-                row.get("stop_name"),
-                row.get("stop_desc"),
-                float(row["stop_lat"]),
-                float(row["stop_lon"]),
-                int(row.get("location_type") or 0),
-                row.get("parent_station"),
-                int(row.get("wheelchair_boarding") or 0),
-            )
-            for row in rows
-            if row.get("stop_lat") and row.get("stop_lon")
-        ],
-    )
-    conn.commit()
+    for batch in _batched(rows):
+        cur.executemany(
+            """
+            INSERT OR REPLACE INTO stops(
+              stop_id, stop_name, stop_desc, stop_lat, stop_lon,
+              location_type, parent_station, wheelchair_boarding
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["stop_id"],
+                    row.get("stop_name"),
+                    row.get("stop_desc"),
+                    float(row["stop_lat"]),
+                    float(row["stop_lon"]),
+                    int(row.get("location_type") or 0),
+                    row.get("parent_station"),
+                    int(row.get("wheelchair_boarding") or 0),
+                )
+                for row in batch
+                if row.get("stop_lat") and row.get("stop_lon")
+            ],
+        )
+        conn.commit()
 
 
 def import_routes(conn, rows):
     cur = conn.cursor()
-    cur.executemany(
-        """
-        INSERT OR REPLACE INTO routes(route_id, short_name, long_name, type)
-        VALUES (?, ?, ?, ?)
-        """,
-        [
-            (
-                row["route_id"],
-                row.get("route_short_name"),
-                row.get("route_long_name"),
-                int(row.get("route_type") or 0),
-            )
-            for row in rows
-        ],
-    )
-    conn.commit()
+    for batch in _batched(rows):
+        cur.executemany(
+            """
+            INSERT OR REPLACE INTO routes(route_id, short_name, long_name, type)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["route_id"],
+                    row.get("route_short_name"),
+                    row.get("route_long_name"),
+                    int(row.get("route_type") or 0),
+                )
+                for row in batch
+            ],
+        )
+        conn.commit()
 
 
 def import_trips(conn, rows):
     cur = conn.cursor()
-    cur.executemany(
-        """
-        INSERT OR REPLACE INTO trips(
-          trip_id, route_id, service_id, headsign, direction_id, shape_id
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        [
-            (
-                row["trip_id"],
-                row["route_id"],
-                row["service_id"],
-                row.get("trip_headsign"),
-                int(row.get("direction_id") or 0),
-                row.get("shape_id"),
-            )
-            for row in rows
-        ],
-    )
-    conn.commit()
+    for batch in _batched(rows):
+        cur.executemany(
+            """
+            INSERT OR REPLACE INTO trips(
+              trip_id, route_id, service_id, headsign, direction_id, shape_id
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["trip_id"],
+                    row["route_id"],
+                    row["service_id"],
+                    row.get("trip_headsign"),
+                    int(row.get("direction_id") or 0),
+                    row.get("shape_id"),
+                )
+                for row in batch
+            ],
+        )
+        conn.commit()
 
 
 def import_stop_times(conn, rows):
     cur = conn.cursor()
-    batch = []
-    for row in rows:
-        batch.append(
-            (
-                row["trip_id"],
-                row.get("arrival_time"),
-                row.get("departure_time"),
-                row["stop_id"],
-                int(row.get("stop_sequence") or 0),
-                int(row.get("pickup_type") or 0),
-                int(row.get("drop_off_type") or 0),
-            )
-        )
-        if len(batch) >= 2000:
-            cur.executemany(
-                """
-                INSERT OR REPLACE INTO stop_times(
-                  trip_id, arrival_time, departure_time,
-                  stop_id, stop_sequence, pickup_type, drop_off_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                batch,
-            )
-            conn.commit()
-            batch = []
-    if batch:
+    for batch in _batched(rows):
         cur.executemany(
             """
             INSERT OR REPLACE INTO stop_times(
@@ -262,65 +297,83 @@ def import_stop_times(conn, rows):
               stop_id, stop_sequence, pickup_type, drop_off_type
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            batch,
+            [
+                (
+                    row["trip_id"],
+                    row.get("arrival_time"),
+                    row.get("departure_time"),
+                    row["stop_id"],
+                    int(row.get("stop_sequence") or 0),
+                    int(row.get("pickup_type") or 0),
+                    int(row.get("drop_off_type") or 0),
+                )
+                for row in batch
+            ],
         )
         conn.commit()
 
 
 def import_calendar(conn, rows):
     cur = conn.cursor()
-    cur.executemany(
-        """
-        INSERT OR REPLACE INTO calendar(
-          service_id, monday, tuesday, wednesday,
-          thursday, friday, saturday, sunday,
-          start_date, end_date
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            (
-                row["service_id"],
-                int(row.get("monday") or 0),
-                int(row.get("tuesday") or 0),
-                int(row.get("wednesday") or 0),
-                int(row.get("thursday") or 0),
-                int(row.get("friday") or 0),
-                int(row.get("saturday") or 0),
-                int(row.get("sunday") or 0),
-                row.get("start_date"),
-                row.get("end_date"),
-            )
-            for row in rows
-        ],
-    )
-    conn.commit()
+    for batch in _batched(rows):
+        cur.executemany(
+            """
+            INSERT OR REPLACE INTO calendar(
+              service_id, monday, tuesday, wednesday,
+              thursday, friday, saturday, sunday,
+              start_date, end_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["service_id"],
+                    int(row.get("monday") or 0),
+                    int(row.get("tuesday") or 0),
+                    int(row.get("wednesday") or 0),
+                    int(row.get("thursday") or 0),
+                    int(row.get("friday") or 0),
+                    int(row.get("saturday") or 0),
+                    int(row.get("sunday") or 0),
+                    row.get("start_date"),
+                    row.get("end_date"),
+                )
+                for row in batch
+            ],
+        )
+        conn.commit()
 
 
 def import_calendar_dates(conn, rows):
     cur = conn.cursor()
+    for batch in _batched(rows):
+        cur.executemany(
+            """
+            INSERT INTO calendar_dates(service_id, date, exception_type)
+            VALUES (?, ?, ?)
+            """,
+            [
+                (
+                    row["service_id"],
+                    row["date"],
+                    int(row.get("exception_type") or 0),
+                )
+                for row in batch
+            ],
+        )
+        conn.commit()
+
+
+def _insert_service_days(cur, pairs):
     cur.executemany(
         """
-        INSERT INTO calendar_dates(service_id, date, exception_type)
-        VALUES (?, ?, ?)
+        INSERT OR REPLACE INTO service_days(service_id, service_date)
+        VALUES (?, ?)
         """,
-        [
-            (
-                row["service_id"],
-                row["date"],
-                int(row.get("exception_type") or 0),
-            )
-            for row in rows
-        ],
+        pairs,
     )
-    conn.commit()
 
 
-def build_service_days(conn):
-    cur = conn.cursor()
-    cur.execute("DELETE FROM service_days")
-    conn.commit()
-
-    calendars = cur.execute("SELECT * FROM calendar").fetchall()
+def _iter_service_days(calendars):
     for cal in calendars:
         service_id = cal[0]
         start = parse_yyyymmdd(cal[8])
@@ -331,38 +384,39 @@ def build_service_days(conn):
         while current <= end:
             weekday_column = current.weekday()
             if cal[weekday_column + 1]:
-                cur.execute(
-                    """
-                    INSERT OR REPLACE INTO service_days(service_id, service_date)
-                    VALUES (?, ?)
-                    """,
-                    (service_id, format_yyyymmdd(current)),
-                )
+                yield (service_id, format_yyyymmdd(current))
             current += timedelta(days=1)
+
+
+def build_service_days(conn):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM service_days")
+    conn.commit()
+
+    # Expanding calendar.txt into one row per (service_id, date) can produce
+    # hundreds of thousands of rows for a statewide feed. Batch + commit
+    # periodically instead of one INSERT per row held in a single giant
+    # transaction — that used to build up a huge rollback journal that only
+    # got flushed to disk in one burst at the final commit.
+    calendars = cur.execute("SELECT * FROM calendar").fetchall()
+    for batch in _batched(_iter_service_days(calendars)):
+        _insert_service_days(cur, batch)
+        conn.commit()
 
     additions = cur.execute(
         """SELECT service_id, date FROM calendar_dates WHERE exception_type = 1"""
     ).fetchall()
-    for service_id, date in additions:
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO service_days(service_id, service_date)
-            VALUES (?, ?)
-            """,
-            (service_id, date),
-        )
+    for batch in _batched(additions):
+        _insert_service_days(cur, batch)
+        conn.commit()
 
     removals = cur.execute(
         """SELECT service_id, date FROM calendar_dates WHERE exception_type = 2"""
     ).fetchall()
-    for service_id, date in removals:
-        cur.execute(
-            """
-            DELETE FROM service_days WHERE service_id = ? AND service_date = ?
-            """,
-            (service_id, date),
-        )
-
+    cur.executemany(
+        "DELETE FROM service_days WHERE service_id = ? AND service_date = ?",
+        removals,
+    )
     conn.commit()
 
 
@@ -394,20 +448,20 @@ def format_yyyymmdd(value: datetime) -> str:
 
 def main():
     ensure_output_dir()
-    raw = download_zip()
-    zf = zipfile.ZipFile(io.BytesIO(raw))
+    zip_path = ensure_zip_downloaded(ZIP_CACHE_PATH)
+    zf = zipfile.ZipFile(zip_path)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         db_path = os.path.join(tmp_dir, "gtfs_temp.sqlite")
         conn = open_db(db_path)
         clear_tables(conn)
 
-        import_stops(conn, read_csv_from_zip(zf, "stops.txt"))
-        import_routes(conn, read_csv_from_zip(zf, "routes.txt"))
-        import_trips(conn, read_csv_from_zip(zf, "trips.txt"))
-        import_stop_times(conn, read_csv_from_zip(zf, "stop_times.txt"))
-        import_calendar(conn, read_csv_from_zip(zf, "calendar.txt"))
-        import_calendar_dates(conn, read_csv_from_zip(zf, "calendar_dates.txt"))
+        import_stops(conn, iter_csv_from_zip(zf, "stops.txt"))
+        import_routes(conn, iter_csv_from_zip(zf, "routes.txt"))
+        import_trips(conn, iter_csv_from_zip(zf, "trips.txt"))
+        import_stop_times(conn, iter_csv_from_zip(zf, "stop_times.txt"))
+        import_calendar(conn, iter_csv_from_zip(zf, "calendar.txt"))
+        import_calendar_dates(conn, iter_csv_from_zip(zf, "calendar_dates.txt"))
 
         build_service_days(conn)
         build_route_types(conn)

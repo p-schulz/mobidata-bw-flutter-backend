@@ -4,6 +4,8 @@
 
 This project provides a lightweight, self-hosted mobility API backend for the **MobiData BW in Flutter App**: https://github.com/p-schulz/mobidata-bw-flutter  
 
+The provided shape files 'v_al_gemeinde.*' for the geocoder are under license "Datenquelle: LGL, www.lgl-bw.de, dl-de/by-2-0" and only provided for fast server setup
+
 It exposes a clean HTTP API for:
 - `GET /stops/bbox` — spatial stop queries using local GTFS data  
 - `GET /departures` — GTFS-based fallback departure board  
@@ -28,7 +30,50 @@ The backend is designed to be:
 
 ---
 
-## Prerequisites
+## Automated Setup (Ubuntu)
+
+`./setup.sh` is a complete, one-shot setup: system packages, the venv,
+Python dependencies, a generated `trias-proxy/.env`, the GTFS seed and
+locations databases, a `systemd` service (so the proxy survives crashes and
+reboots — no more manual `screen` sessions), and an nginx reverse proxy in
+front of it.
+
+```bash
+sudo ./setup.sh
+```
+
+With no options, this:
+- runs `generate_gtfs_seed.py` to download the current GTFS ZIP and build
+  `trias-proxy/gtfs_seed.sqlite` (pass `--gtfs-db <path>` to use a pre-built
+  file instead, or `--skip-gtfs-build` to skip it)
+- installs `trias-proxy/locations.sqlite` from `--locations-db <path>` if
+  given, or builds it from a shapefile with `--lgl-shp
+  /path/to/v_al_gemeinde.shp` (the LGL-BW admin-boundaries shapefile isn't
+  auto-downloadable — obtain it separately); without either, this step is
+  skipped with a warning
+- installs and enables the `trias-proxy` systemd service
+- installs an nginx reverse proxy in front of it, using `--domain
+  your.host.name` if given, otherwise the server's own detected IP address
+  (see `deploy/nginx-trias-proxy.conf`; follow up with `sudo certbot --nginx
+  -d your.host.name` for TLS — that needs a real domain, not a bare IP)
+
+Run `./setup.sh --help` for all options, or `./setup.sh --skip-systemd
+--skip-nginx --skip-gtfs-build` to only do the manual steps below. The
+script is idempotent — safe to re-run after pulling updates; it never
+overwrites an `.env` or database file that's already in place.
+
+Once installed:
+
+```bash
+sudo systemctl {start|stop|restart|status} trias-proxy
+journalctl -u trias-proxy -f          # logs
+```
+
+The `systemd` unit template lives at `deploy/trias-proxy.service`; the
+`screen`-based `start_triasproxy.sh` / `stop_trias.sh` scripts below still
+work for quick manual/dev runs.
+
+## Manual Setup
 
 ### System Requirements (tested on Ubuntu 22.04+)
 
@@ -46,7 +91,7 @@ cd trias-proxy
 python3 -m venv venv
 source venv/bin/activate
 
-pip install fastapi uvicorn httpx slowapi
+pip install -r requirements.txt
 ```
 
 

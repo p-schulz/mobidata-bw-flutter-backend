@@ -54,6 +54,27 @@ def load_gemeinden():
     print(f"[INFO] Lade Shapefile: {SHP_PATH}")
     gdf = gpd.read_file(SHP_PATH)
 
+    required_fields = [SHP_FIELD_AGS, SHP_FIELD_NAME]
+    if SHP_FIELD_LANDKREIS:
+        required_fields.append(SHP_FIELD_LANDKREIS)
+    if SHP_FIELD_REGION:
+        required_fields.append(SHP_FIELD_REGION)
+    missing = [f for f in required_fields if f not in gdf.columns]
+    if missing:
+        dbf_path = os.path.splitext(SHP_PATH)[0] + ".dbf"
+        hint = ""
+        if not os.path.exists(dbf_path):
+            hint = (
+                f" {os.path.basename(dbf_path)} (the attribute table) is missing "
+                "next to the .shp file — a shapefile needs its .shp/.shx/.dbf "
+                "(and ideally .prj) sidecar files all present, with the same base "
+                "name, before it has any attribute columns at all."
+            )
+        raise RuntimeError(
+            f"Shapefile at {SHP_PATH} is missing expected column(s) {missing}. "
+            f"Columns found: {list(gdf.columns)}.{hint}"
+        )
+
     print(f"[INFO] Datensätze gesamt: {len(gdf)}")
     if SHP_FILTER_FIELD and SHP_FILTER_VALUE is not None:
         before = len(gdf)
