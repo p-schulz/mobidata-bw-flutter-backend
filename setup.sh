@@ -7,7 +7,9 @@
 # databases (via generate_gtfs_seed.py / build_locations_from_lgl.py) and
 # moves them into place, installs the app as a systemd service, and puts an
 # nginx reverse proxy in front of it (using --domain if given, otherwise the
-# server's own detected IP address as the hostname).
+# server's own detected IP address as the hostname). Also installs the
+# PMTiles server (go-pmtiles) as a second systemd service for vector map tiles
+# and, if --tiles-source is given, extracts a regional .pmtiles file from it.
 #
 # Usage:
 #   ./setup.sh [options]
@@ -28,7 +30,17 @@
 #   --skip-apt              Skip system package installation
 #   --skip-systemd          Skip systemd service installation
 #   --skip-nginx            Skip nginx installation/config entirely
-#   --no-start              Install the systemd service but don't start it now
+#   --tiles-source SRC      Source archive for `pmtiles extract`: a local path
+#                           or remote URL of a (planet) .pmtiles file. Without
+#                           it, no tile file is created (a warning is printed).
+#   --tiles-bbox BBOX       min_lon,min_lat,max_lon,max_lat to extract
+#                           (default: 7.4,47.4,10.6,49.9 = Baden-Wuerttemberg)
+#   --tiles-name NAME       Region name; the file becomes NAME.pmtiles and is
+#                           served as /NAME/{z}/{x}/{y}.mvt (default: bw)
+#   --tiles-dir DIR         Directory holding .pmtiles files (default: /var/www/maps)
+#   --tiles-port PORT       Port of the tile server (default: 8081; 8080 is the API)
+#   --skip-tiles            Skip the tile server (binary, service, extract)
+#   --no-start              Install the systemd services but don't start them now
 #   -h, --help              Show this help
 #
 # Safe to re-run: every step checks current state before changing anything.
@@ -52,7 +64,21 @@ SKIP_NGINX="false"
 SKIP_GTFS_BUILD="false"
 START_SERVICE="true"
 
-log()  { printf '\n\033[1;34m==>\033[0m %s\n' "$1"; }
+PMTILES_VERSION="1.31.2"
+PMTILES_URL="https://github.com/protomaps/go-pmtiles/releases/download/v${PMTILES_VERSION}/go-pmtiles_${PMTILES_VERSION}_Linux_x86_64.tar.gz"
+# The release publishes no checksum file, so this pins the SHA-256 of the
+# v1.31.2 Linux x86_64 tarball as downloaded from the official release URL.
+PMTILES_SHA256="3ed7dbf4ec2e6dfe5e25b6f70d1ffc932729f93c86db353bf514dd71010a312f"
+PMTILES_BIN="/usr/local/bin/pmtiles"
+TILES_SOURCE=""
+TILES_BBOX="7.4,47.4,10.6,49.9"
+TILES_NAME="bw"
+TILES_DIR="/var/www/maps"
+TILES_PORT="8083"
+STYLES_DIR="/var/www/styles"
+SKIP_TILES="false"
+
+log() { printf '\n\033[1;34m==>\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$1" >&2; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 
@@ -72,6 +98,12 @@ while [ $# -gt 0 ]; do
         --skip-apt) SKIP_APT="true"; shift ;;
         --skip-systemd) SKIP_SYSTEMD="true"; shift ;;
         --skip-nginx) SKIP_NGINX="true"; shift ;;
+        --tiles-source) TILES_SOURCE="$2"; shift 2 ;;
+        --tiles-bbox) TILES_BBOX="$2"; shift 2 ;;
+        --tiles-name) TILES_NAME="$2"; shift 2 ;;
+        --tiles-dir) TILES_DIR="$2"; shift 2 ;;
+        --tiles-port) TILES_PORT="$2"; shift 2 ;;
+        --skip-tiles) SKIP_TILES="true"; shift ;;
         --no-start) START_SERVICE="false"; shift ;;
         -h|--help) print_help; exit 0 ;;
         *) die "Unknown option: $1 (see --help)" ;;
@@ -195,6 +227,123 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+log "Vector tiles (PMTiles server)"
+# ---------------------------------------------------------------------------
+[ "$TILES_PORT" != "$PORT" ] || die "--tiles-port must differ from --port ($PORT is the API)."
+
+USE_NGINX="false"
+if [ "$SKIP_NGINX" != "true" ] && [ -n "$DOMAIN" ] && command -v nginx >/dev/null 2>&1; then
+    USE_NGINX="true"
+fi
+
+if [ "$SKIP_TILES" != "true" ] && [ "$(uname -s)-$(uname -m)" != "Linux-x86_64" ]; then
+    warn "The pinned go-pmtiles release is Linux x86_64 only (this is $(uname -s)-$(uname -m)) — skipping the tile server."
+    SKIP_TILES="true"
+fi
+
+if [ "$SKIP_TILES" = "true" ]; then
+    echo "Skipped."
+else
+    INSTALLED_VERSION=""
+    [ -x "$PMTILES_BIN" ] && INSTALLED_VERSION="$("$PMTILES_BIN" version 2>/dev/null || true)"
+    case "$INSTALLED_VERSION" in
+        "pmtiles ${PMTILES_VERSION},"*) ALREADY_INSTALLED="true" ;;
+        *) ALREADY_INSTALLED="false" ;;
+    esac
+    if [ "$ALREADY_INSTALLED" = "true" ]; then
+        echo "pmtiles ${PMTILES_VERSION} already installed at $PMTILES_BIN."
+    else
+        TMP_DL="$(mktemp -d)"
+        echo "Downloading go-pmtiles ${PMTILES_VERSION}…"
+        curl -fSL --retry 3 -o "$TMP_DL/pmtiles.tar.gz" "$PMTILES_URL"
+        if ! echo "${PMTILES_SHA256}  $TMP_DL/pmtiles.tar.gz" | sha256sum -c - >/dev/null 2>&1; then
+            rm -rf "$TMP_DL"
+            die "SHA-256 mismatch for the downloaded go-pmtiles tarball — refusing to install it."
+        fi
+        tar -xzf "$TMP_DL/pmtiles.tar.gz" -C "$TMP_DL" pmtiles
+        $SUDO install -m 755 "$TMP_DL/pmtiles" "$PMTILES_BIN"
+        rm -rf "$TMP_DL"
+        echo "Installed $PMTILES_BIN"
+    fi
+
+    $SUDO install -d -o "$APP_USER" -m 755 "$TILES_DIR"
+
+    TILES_FILE="$TILES_DIR/$TILES_NAME.pmtiles"
+    if [ -f "$TILES_FILE" ]; then
+        echo "$TILES_FILE already present, leaving it untouched (delete it to re-extract)."
+    elif [ -n "$TILES_SOURCE" ]; then
+        echo "Extracting bbox $TILES_BBOX from $TILES_SOURCE (this can take a while)…"
+        "$PMTILES_BIN" extract "$TILES_SOURCE" "$TILES_FILE.part" --bbox="$TILES_BBOX"
+        chmod 644 "$TILES_FILE.part"
+        mv -f "$TILES_FILE.part" "$TILES_FILE"
+        echo "Wrote $TILES_FILE"
+    else
+        warn "No $TILES_FILE and no --tiles-source given, so no tiles will be served yet. Re-run with --tiles-source <planet .pmtiles path or URL>, or run: pmtiles extract <source> $TILES_FILE --bbox=$TILES_BBOX"
+    fi
+
+    # Map styles (Mapbox style spec) for the client. Unlike the databases these
+    # are regenerated on every run, so palette edits in
+    # deploy/styles/generate_styles.py take effect on the next setup.sh run.
+    TILES_HOST="${DOMAIN:-$(detect_host_ip)}"
+    if [ "$USE_NGINX" = "true" ]; then
+        TILES_URL="http://${DOMAIN}/tiles/${TILES_NAME}/{z}/{x}/{y}.mvt"
+    else
+        TILES_URL="http://${TILES_HOST:-<server-ip>}:${TILES_PORT}/${TILES_NAME}/{z}/{x}/{y}.mvt"
+    fi
+    if [ -z "$TILES_HOST" ]; then
+        warn "Could not determine the server's host/IP — skipping map style generation. Re-run with --domain <host>."
+    else
+        $SUDO install -d -o "$APP_USER" -m 755 "$STYLES_DIR"
+        python3 "$DEPLOY_DIR/styles/generate_styles.py" --tiles-url "$TILES_URL" --out "$STYLES_DIR"
+        if [ "$USE_NGINX" != "true" ]; then
+            warn "Styles were written to $STYLES_DIR, but only nginx serves them (at /styles/). Without nginx, host that directory yourself."
+        fi
+    fi
+
+    if [ "$SKIP_SYSTEMD" = "true" ]; then
+        echo "systemd unit skipped (--skip-systemd). Run manually: $PMTILES_BIN serve $TILES_DIR --port=$TILES_PORT --cors='*'"
+    elif ! command -v systemctl >/dev/null 2>&1; then
+        warn "systemctl not found — skipping the pmtiles systemd unit."
+    else
+        if id -u www-data >/dev/null 2>&1; then TILES_USER="www-data"; else TILES_USER="$APP_USER"; fi
+
+        # Behind nginx the tile server only needs to listen locally; otherwise
+        # expose it directly so the client can reach it on TILES_PORT.
+        if [ "$USE_NGINX" = "true" ]; then
+            TILES_INTERFACE="127.0.0.1"
+            PUBLIC_URL="http://${DOMAIN}/tiles"
+        else
+            TILES_INTERFACE="0.0.0.0"
+            TILES_HOST="${DOMAIN:-$(detect_host_ip)}"
+            PUBLIC_URL=""
+            [ -n "$TILES_HOST" ] && PUBLIC_URL="http://${TILES_HOST}:${TILES_PORT}"
+        fi
+        PUBLIC_URL_ARG=""
+        [ -n "$PUBLIC_URL" ] && PUBLIC_URL_ARG="--public-url=${PUBLIC_URL}"
+
+        PMTILES_UNIT="/etc/systemd/system/pmtiles.service"
+        sed \
+            -e "s#__TILES_USER__#${TILES_USER}#g" \
+            -e "s#__TILES_DIR__#${TILES_DIR}#g" \
+            -e "s#__TILES_INTERFACE__#${TILES_INTERFACE}#g" \
+            -e "s#__TILES_PORT__#${TILES_PORT}#g" \
+            -e "s#__PUBLIC_URL_ARG__#${PUBLIC_URL_ARG}#g" \
+            "$DEPLOY_DIR/pmtiles.service" | $SUDO tee "$PMTILES_UNIT" >/dev/null
+        $SUDO systemctl daemon-reload
+        $SUDO systemctl enable pmtiles
+        echo "Installed and enabled $PMTILES_UNIT (user: $TILES_USER, ${TILES_INTERFACE}:${TILES_PORT})."
+
+        if [ "$START_SERVICE" = "true" ]; then
+            $SUDO systemctl restart pmtiles
+            sleep 1
+            $SUDO systemctl --no-pager status pmtiles || true
+        else
+            echo "Not starting service now (--no-start). Start later with: sudo systemctl start pmtiles"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 log "systemd service"
 # ---------------------------------------------------------------------------
 if [ "$SKIP_SYSTEMD" = "true" ]; then
@@ -233,10 +382,16 @@ elif ! command -v nginx >/dev/null 2>&1; then
 else
     SITE_AVAILABLE="/etc/nginx/sites-available/trias-proxy"
     SITE_ENABLED="/etc/nginx/sites-enabled/trias-proxy"
-    sed \
+    NGINX_CONF="$(sed \
         -e "s#__DOMAIN__#${DOMAIN}#g" \
         -e "s#__PORT__#${PORT}#g" \
-        "$DEPLOY_DIR/nginx-trias-proxy.conf" | $SUDO tee "$SITE_AVAILABLE" >/dev/null
+        -e "s#__TILES_PORT__#${TILES_PORT}#g" \
+        -e "s#__STYLES_DIR__#${STYLES_DIR}#g" \
+        "$DEPLOY_DIR/nginx-trias-proxy.conf")"
+    if [ "$SKIP_TILES" = "true" ]; then
+        NGINX_CONF="$(printf '%s\n' "$NGINX_CONF" | sed '/# BEGIN tiles/,/# END tiles/d')"
+    fi
+    printf '%s\n' "$NGINX_CONF" | $SUDO tee "$SITE_AVAILABLE" >/dev/null
     $SUDO ln -sf "$SITE_AVAILABLE" "$SITE_ENABLED"
     $SUDO nginx -t
     $SUDO systemctl reload nginx
@@ -257,3 +412,13 @@ Config:    $APP_DIR/.env
 Reverse proxy: ${DOMAIN:-"(none — use http://127.0.0.1:$PORT directly)"}
 Health:    curl -H "x-api-key: \$(grep TRIAS_PROXY_API_KEY $APP_DIR/.env | cut -d= -f2)" http://127.0.0.1:$PORT/health
 EOF
+
+if [ "$SKIP_TILES" != "true" ]; then
+    cat <<EOF
+Tiles:     sudo systemctl {start|stop|restart|status} pmtiles   (logs: journalctl -u pmtiles -f)
+Tile URL:  $TILES_URL
+EOF
+    if [ "$USE_NGINX" = "true" ]; then
+        echo "Styles:    http://${DOMAIN}/styles/light.json  and  http://${DOMAIN}/styles/dark.json"
+    fi
+fi

@@ -1,0 +1,29 @@
+# systemd unit template for the PMTiles vector tile server.
+# Filled in and installed by ../setup.sh — placeholders (__TILES_USER__,
+# __TILES_DIR__, __TILES_INTERFACE__, __TILES_PORT__, __PUBLIC_URL_ARG__) are
+# substituted there.
+#
+# Serves every *.pmtiles file in __TILES_DIR__ as
+#   http://<host>:__TILES_PORT__/<file-name-without-extension>/{z}/{x}/{y}.mvt
+# (and a TileJSON at /<name>.json). Files are read per request, so a new or
+# replaced .pmtiles file is picked up without restarting the service.
+
+[Unit]
+Description=PMTiles Tile Server
+After=network.target
+
+[Service]
+Type=simple
+User=__TILES_USER__
+ExecStart=/usr/local/bin/pmtiles serve __TILES_DIR__ --interface=__TILES_INTERFACE__ --port=__TILES_PORT__ --cors=* --cache-size=64 __PUBLIC_URL_ARG__
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
