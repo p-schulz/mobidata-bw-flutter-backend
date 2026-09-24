@@ -10,6 +10,8 @@
 # server's own detected IP address as the hostname). Also installs the
 # PMTiles server (go-pmtiles) as a second systemd service for vector map tiles
 # and, if --tiles-source is given, extracts a regional .pmtiles file from it.
+# With --web-build, deploys the Flutter web client, which nginx serves at /
+# next to the API at /api/, the tiles at /tiles/ and the styles at /styles/.
 #
 # Usage:
 #   ./setup.sh [options]
@@ -17,6 +19,10 @@
 # Options:
 #   --app-user USER       System user the service runs as (default: current user)
 #   --port PORT             Port uvicorn listens on (default: 8080)
+#   --api-interface ADDR    Address uvicorn binds to (default: 0.0.0.0). Use
+#                           127.0.0.1 to reach the API only through nginx at
+#                           /api/ — but app builds that still call
+#                           http://<host>:8080 directly then stop working.
 #   --gtfs-db PATH          Use this pre-built file instead of running
 #                           generate_gtfs_seed.py (copied to trias-proxy/gtfs_seed.sqlite)
 #   --skip-gtfs-build       Don't run generate_gtfs_seed.py if no GTFS DB is present
@@ -27,6 +33,14 @@
 #                           trias-proxy/locations.sqlite from it
 #   --domain DOMAIN         Hostname for the nginx reverse proxy (default: the
 #                           server's own detected IP address)
+#   --https                 Generate https:// URLs (tile URL in the map styles,
+#                           pmtiles public URL). Use once TLS is set up with
+#                           certbot, otherwise browsers block the http:// tile
+#                           URLs as mixed content.
+#   --web-build DIR         Flutter web build to deploy (the output of
+#                           `flutter build web`, containing index.html)
+#   --web-dir DIR           Directory nginx serves the web client from
+#                           (default: /var/www/mobility4bw)
 #   --skip-apt              Skip system package installation
 #   --skip-systemd          Skip systemd service installation
 #   --skip-nginx            Skip nginx installation/config entirely
@@ -38,7 +52,7 @@
 #   --tiles-name NAME       Region name; the file becomes NAME.pmtiles and is
 #                           served as /NAME/{z}/{x}/{y}.mvt (default: bw)
 #   --tiles-dir DIR         Directory holding .pmtiles files (default: /var/www/maps)
-#   --tiles-port PORT       Port of the tile server (default: 8081; 8080 is the API)
+#   --tiles-port PORT       Port of the tile server (default: 8083; 8080 is the API)
 #   --skip-tiles            Skip the tile server (binary, service, extract)
 #   --no-start              Install the systemd services but don't start them now
 #   -h, --help              Show this help
@@ -54,6 +68,10 @@ DEPLOY_DIR="$REPO_ROOT/deploy"
 
 APP_USER="${SUDO_USER:-$(id -un)}"
 PORT="8080"
+API_INTERFACE="0.0.0.0"
+SCHEME="http"
+WEB_BUILD=""
+WEB_DIR="/var/www/mobility4bw"
 GTFS_DB_SRC=""
 LOCATIONS_DB_SRC=""
 LGL_SHP=""
@@ -90,6 +108,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --app-user) APP_USER="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
+        --api-interface) API_INTERFACE="$2"; shift 2 ;;
+        --https) SCHEME="https"; shift ;;
+        --web-build) WEB_BUILD="$2"; shift 2 ;;
+        --web-dir) WEB_DIR="$2"; shift 2 ;;
         --gtfs-db) GTFS_DB_SRC="$2"; shift 2 ;;
         --skip-gtfs-build) SKIP_GTFS_BUILD="true"; shift ;;
         --locations-db) LOCATIONS_DB_SRC="$2"; shift 2 ;;
@@ -150,6 +172,9 @@ else
     fi
     if [ -n "$LGL_SHP" ]; then
         PKGS="$PKGS gdal-bin libgdal-dev"
+    fi
+    if [ -n "$WEB_BUILD" ]; then
+        PKGS="$PKGS rsync"
     fi
     $SUDO apt-get update
     # shellcheck disable=SC2086
@@ -286,7 +311,7 @@ else
     # deploy/styles/generate_styles.py take effect on the next setup.sh run.
     TILES_HOST="${DOMAIN:-$(detect_host_ip)}"
     if [ "$USE_NGINX" = "true" ]; then
-        TILES_URL="http://${DOMAIN}/tiles/${TILES_NAME}/{z}/{x}/{y}.mvt"
+        TILES_URL="${SCHEME}://${DOMAIN}/tiles/${TILES_NAME}/{z}/{x}/{y}.mvt"
     else
         TILES_URL="http://${TILES_HOST:-<server-ip>}:${TILES_PORT}/${TILES_NAME}/{z}/{x}/{y}.mvt"
     fi
@@ -311,7 +336,7 @@ else
         # expose it directly so the client can reach it on TILES_PORT.
         if [ "$USE_NGINX" = "true" ]; then
             TILES_INTERFACE="127.0.0.1"
-            PUBLIC_URL="http://${DOMAIN}/tiles"
+            PUBLIC_URL="${SCHEME}://${DOMAIN}/tiles"
         else
             TILES_INTERFACE="0.0.0.0"
             TILES_HOST="${DOMAIN:-$(detect_host_ip)}"
@@ -356,10 +381,11 @@ else
         -e "s#__APP_DIR__#${APP_DIR}#g" \
         -e "s#__APP_USER__#${APP_USER}#g" \
         -e "s#__PORT__#${PORT}#g" \
+        -e "s#__API_INTERFACE__#${API_INTERFACE}#g" \
         "$DEPLOY_DIR/trias-proxy.service" | $SUDO tee "$UNIT_PATH" >/dev/null
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable trias-proxy
-    echo "Installed and enabled $UNIT_PATH (user: $APP_USER, port: $PORT)."
+    echo "Installed and enabled $UNIT_PATH (user: $APP_USER, ${API_INTERFACE}:${PORT})."
 
     if [ "$START_SERVICE" = "true" ]; then
         $SUDO systemctl restart trias-proxy
@@ -368,6 +394,27 @@ else
     else
         echo "Not starting service now (--no-start). Start later with: sudo systemctl start trias-proxy"
     fi
+fi
+
+# ---------------------------------------------------------------------------
+log "Web client"
+# ---------------------------------------------------------------------------
+if [ -z "$WEB_BUILD" ]; then
+    if [ -f "$WEB_DIR/index.html" ]; then
+        echo "No --web-build given, keeping the web client already in $WEB_DIR."
+    else
+        echo "No --web-build given and nothing in $WEB_DIR yet, so / serves no web client. Build it with \`flutter build web\` and re-run with --web-build <path to build/web>."
+    fi
+else
+    [ -f "$WEB_BUILD/index.html" ] || die "--web-build must be a Flutter web build directory containing index.html: $WEB_BUILD"
+    command -v rsync >/dev/null 2>&1 || die "rsync not found — install it (or drop --skip-apt) to deploy the web client."
+    $SUDO install -d -o "$APP_USER" -m 755 "$WEB_DIR"
+    # --delete removes files of the previous build; the entry points are
+    # copied last so browsers never load a new index.html with old assets.
+    rsync -a --delete --exclude index.html --exclude flutter_bootstrap.js "$WEB_BUILD/" "$WEB_DIR/"
+    rsync -a "$WEB_BUILD/index.html" "$WEB_BUILD/flutter_bootstrap.js" "$WEB_DIR/"
+    echo "Deployed $WEB_BUILD -> $WEB_DIR"
+    [ "$SKIP_NGINX" != "true" ] || warn "--skip-nginx given: the web client in $WEB_DIR is only served by nginx."
 fi
 
 # ---------------------------------------------------------------------------
@@ -387,15 +434,23 @@ else
         -e "s#__PORT__#${PORT}#g" \
         -e "s#__TILES_PORT__#${TILES_PORT}#g" \
         -e "s#__STYLES_DIR__#${STYLES_DIR}#g" \
+        -e "s#__WEB_DIR__#${WEB_DIR}#g" \
         "$DEPLOY_DIR/nginx-trias-proxy.conf")"
     if [ "$SKIP_TILES" = "true" ]; then
         NGINX_CONF="$(printf '%s\n' "$NGINX_CONF" | sed '/# BEGIN tiles/,/# END tiles/d')"
     fi
-    printf '%s\n' "$NGINX_CONF" | $SUDO tee "$SITE_AVAILABLE" >/dev/null
-    $SUDO ln -sf "$SITE_AVAILABLE" "$SITE_ENABLED"
-    $SUDO nginx -t
-    $SUDO systemctl reload nginx
-    echo "Installed nginx site for $DOMAIN -> 127.0.0.1:$PORT."
+    if [ -f "$SITE_AVAILABLE" ] && grep -q "managed by Certbot" "$SITE_AVAILABLE"; then
+        # Overwriting would drop the TLS server block certbot added.
+        NEW_CONF="$SITE_AVAILABLE.setup-new"
+        printf '%s\n' "$NGINX_CONF" | $SUDO tee "$NEW_CONF" >/dev/null
+        warn "$SITE_AVAILABLE was modified by certbot, leaving it untouched. The config this run would install is in $NEW_CONF — merge its location blocks into the TLS server block by hand, then: sudo nginx -t && sudo systemctl reload nginx"
+    else
+        printf '%s\n' "$NGINX_CONF" | $SUDO tee "$SITE_AVAILABLE" >/dev/null
+        $SUDO ln -sf "$SITE_AVAILABLE" "$SITE_ENABLED"
+        $SUDO nginx -t
+        $SUDO systemctl reload nginx
+        echo "Installed nginx site for $DOMAIN: / -> $WEB_DIR, /api/ -> 127.0.0.1:$PORT."
+    fi
     case "$DOMAIN" in
         *[a-zA-Z]*) echo "For TLS, run: sudo certbot --nginx -d $DOMAIN" ;;
         *) echo "Note: $DOMAIN looks like a bare IP — certbot/TLS needs a real domain name pointed at it." ;;
@@ -410,6 +465,8 @@ Service:   sudo systemctl {start|stop|restart|status} trias-proxy
 Logs:      journalctl -u trias-proxy -f
 Config:    $APP_DIR/.env
 Reverse proxy: ${DOMAIN:-"(none — use http://127.0.0.1:$PORT directly)"}
+Web client: ${DOMAIN:+${SCHEME}://${DOMAIN}/}${DOMAIN:-"(needs nginx)"}   (files: $WEB_DIR)
+API:       ${DOMAIN:+${SCHEME}://${DOMAIN}/api/}${DOMAIN:-"http://127.0.0.1:$PORT/"}   (direct: ${API_INTERFACE}:${PORT})
 Health:    curl -H "x-api-key: \$(grep TRIAS_PROXY_API_KEY $APP_DIR/.env | cut -d= -f2)" http://127.0.0.1:$PORT/health
 EOF
 
@@ -419,6 +476,6 @@ Tiles:     sudo systemctl {start|stop|restart|status} pmtiles   (logs: journalct
 Tile URL:  $TILES_URL
 EOF
     if [ "$USE_NGINX" = "true" ]; then
-        echo "Styles:    http://${DOMAIN}/styles/light.json  and  http://${DOMAIN}/styles/dark.json"
+        echo "Styles:    ${SCHEME}://${DOMAIN}/styles/light.json  and  ${SCHEME}://${DOMAIN}/styles/dark.json"
     fi
 fi
